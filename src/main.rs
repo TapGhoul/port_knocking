@@ -1,67 +1,25 @@
 mod knock_meta;
 mod knock_state;
+mod socket;
 
 use ahash::{HashMap, HashMapExt};
 use knock_meta::KnockMeta;
 use knock_state::KnockState;
 use quanta::{Instant, Upkeep};
 use slotmap::{DefaultKey, SlotMap};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket::RawSocket;
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::mem;
 use std::net::IpAddr;
-use std::pin::Pin;
-use std::task::{ready, Context, Poll};
 use std::time::Duration;
-use std::{io, mem};
-use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncReadExt, Interest, ReadBuf};
+use tokio::io::AsyncReadExt;
 use tokio::time::interval;
 use tokio::{pin, select};
 use tracing::{info, trace, Level};
 
 type KnockKey = DefaultKey;
 
-struct RawSocket {
-    inner: AsyncFd<Socket>,
-}
-
-impl RawSocket {
-    fn new() -> tokio::io::Result<Self> {
-        let sock = Socket::new_raw(Domain::PACKET, Type::RAW, Some(Protocol::from(768)))?;
-        sock.set_nonblocking(true)?;
-        let inner = AsyncFd::with_interest(sock, Interest::READABLE)?;
-        Ok(Self { inner })
-    }
-}
-
-impl AsyncRead for RawSocket {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        loop {
-            let mut guard = ready!(self.inner.poll_read_ready(cx))?;
-
-            let unfilled = buf.initialize_unfilled();
-            match guard.try_io(|inner| inner.get_ref().read(unfilled)) {
-                Ok(Ok(len)) => {
-                    buf.advance(len);
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(Err(err)) => return Poll::Ready(Err(err)),
-                Err(_would_block) => continue,
-            }
-        }
-    }
-}
-
-// TODO: Move to tokio current_thread executor - no locks needed if we do and allows for easy time
-//       slicing between cleanup and packet processing
-// TODO: Switch to either nix crate or socket2 to create raw socket to feed into tokio's AsyncFd
-// TODO: Either use etherparse or libpnet_packet for parsing - etherparse is zero-copy
 fn main() {
     tracing_subscriber::fmt()
         .with_target(false)
@@ -134,7 +92,7 @@ fn handle_knock(
         Entry::Vacant(_) => KnockState::try_new(dst_port),
         Entry::Occupied(e) => {
             if let KnockState::Passed { .. } = knock_states[e.get().clone()] {
-                trace!("Backdoor already open");
+                trace!("Door already open");
                 return;
             }
 
@@ -182,7 +140,7 @@ fn handle_knock(
             info!("Knock...");
         }
         KnockState::Passed { .. } => {
-            info!("Backdoor opened");
+            info!("Door opened");
         }
         KnockState::Failed => unreachable!("This is never valid by this point"),
     }
@@ -202,7 +160,7 @@ fn handle_cleanup(
     for (addr, key) in expired_items.into_values().flatten() {
         if let Some(knock) = knock_states.remove(key) {
             if matches!(knock, KnockState::Passed { .. }) {
-                info!("Backdoor closed for {addr}");
+                info!("Door closed for {addr}");
             } else {
                 info!("Cleared knock attempts for {addr}");
             }
