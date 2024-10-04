@@ -8,9 +8,9 @@ use knock_state::KnockState;
 use quanta::{Instant, Upkeep};
 use slotmap::{DefaultKey, SlotMap};
 use socket::RawSocket;
+use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
-use std::collections::BTreeMap;
-use std::mem;
+use std::collections::BinaryHeap;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -21,7 +21,7 @@ use tracing::{info, instrument, trace, Level, Span};
 type KnockKey = DefaultKey;
 type KnockStates = SlotMap<KnockKey, KnockState>;
 type ActiveKnocks = HashMap<IpAddr, KnockKey>;
-type ExpirationQueue = BTreeMap<Instant, Vec<(IpAddr, KnockKey)>>;
+type ExpirationQueue = BinaryHeap<(Reverse<Instant>, KnockKey, IpAddr)>;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -58,7 +58,7 @@ async fn run() {
      * properly benchmarked. But I will leave that as an exercise to the reader
      * (which will probably be me in 6 months).
      *
-     * As for using a BTreeMap here, it's an easy way to do a queue. Again, realistically, I should
+     * As for using a BinaryHeap here, it's an easy way to do a queue. Again, realistically, I should
      * use a ring buffer or something. But it's fine. Really. I'm not going to talk myself into
      * spending another 3 days mico-benchmarking this. I swear.
      *
@@ -150,20 +150,8 @@ fn handle_knock(
         return;
     }
 
-    let expiration = knock.expiration();
     let knock_key = knock_states.insert(knock);
-
-    match expiration_queue
-        .last_entry()
-        .filter(|e| e.key() == &expiration)
-    {
-        Some(mut e) => {
-            e.get_mut().push((addr, knock_key));
-        }
-        None => {
-            expiration_queue.insert(expiration, vec![(addr, knock_key)]);
-        }
-    };
+    expiration_queue.push((Reverse(knock.expiration()), knock_key, addr));
 
     // Probably a premature optimization. But why re-hash when you don't need to?
     match knock_entry {
@@ -194,18 +182,24 @@ fn handle_cleanup(
 ) {
     // Cannot use the one from cleanup interval, as we are using quanta's version for performance
     let now = Instant::recent();
-    // This returns the second half initially, we want the opposite
-    let mut expired_items = expiration_queue.split_off(&now);
-    mem::swap(expiration_queue, &mut expired_items);
 
-    for (addr, key) in expired_items.into_values().flatten() {
-        if let Some(knock) = knock_states.remove(key) {
-            if matches!(knock, KnockState::Passed { .. }) {
-                info!(%addr, "Door closed");
-            } else {
-                info!(%addr, "Cleared knock attempts");
-            }
-            active_knocks.remove(&addr);
+    while expiration_queue
+        .peek()
+        .map(|(Reverse(expiration), ..)| *expiration <= now)
+        .is_some()
+    {
+        let (_, knock_key, addr) = expiration_queue.pop().unwrap();
+        // We don't want to accidentally clear an expired knock
+        let Some(knock) = knock_states.remove(knock_key) else {
+            continue;
+        };
+
+        active_knocks.remove(&addr);
+
+        if matches!(knock, KnockState::Passed { .. }) {
+            info!(%addr, "Door closed");
+        } else {
+            info!(%addr, "Cleared knock attempts");
         }
     }
 }
