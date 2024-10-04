@@ -25,6 +25,18 @@ pub struct TryFromSliceError;
 impl TryFrom<&[u8]> for KnockMeta {
     type Error = TryFromSliceError;
 
+    /*
+     * I know someone will yell at me about the single responsibility principle or something like that.
+     * I like my wall of code. My wall of code works. This is hacky experiment code I wrote and iterated on
+     * a huge number of times. This doesn't deserve to be in a real product, and it never will be.
+     * But it works, and that's all I care about.
+     */
+    /**
+     * This method makes some assumptions - you only care about SYN packets on TCP and all UDP packets,
+     * and you don't care if the packet comes from TCP or UDP.
+     *
+     * It also parses more than I need, but I wanted something I could toy with later.
+     */
     #[instrument(name = "parse_packet")]
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         macro_rules! bail {
