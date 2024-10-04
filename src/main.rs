@@ -16,9 +16,12 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::time::interval;
 use tokio::{pin, select};
-use tracing::{info, trace, Level};
+use tracing::{info, info_span, instrument, trace, Level};
 
 type KnockKey = DefaultKey;
+type KnockStates = SlotMap<KnockKey, KnockState>;
+type ActiveKnocks = HashMap<IpAddr, KnockKey>;
+type ExpirationQueue = BTreeMap<Instant, Vec<(IpAddr, KnockKey)>>;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -63,9 +66,9 @@ async fn run() {
      * to replace this with a sparse bitmap or something that'll have theoretically faster access
      * and write times, that's on you. I'm happy with ahash and hashmaps for now.
      */
-    let mut knock_states = SlotMap::<KnockKey, KnockState>::new();
-    let mut active_knocks = HashMap::<IpAddr, KnockKey>::new();
-    let mut expiration_queue = BTreeMap::<Instant, Vec<(IpAddr, KnockKey)>>::new();
+    let mut knock_states = KnockStates::new();
+    let mut active_knocks = ActiveKnocks::new();
+    let mut expiration_queue = ExpirationQueue::new();
     let mut buf = [0u8; 256];
 
     let mut socket = RawSocket::new().unwrap();
@@ -95,36 +98,46 @@ async fn run() {
     }
 }
 
+/*
+ * If you think this looks like it's overcomplicated, you'd be correct. But, I avoid re-hashing
+ * wherever possible. You can't stop me, I ain't getting paid to do it right. Lemme have my fun.
+ *
+ * You'd think cloning the key is some awful thing. But it's defined as
+ * `DefaultKey(KeyData { idx: u32, version: NonZeroU32 })` - 8 bytes.
+ * If anyone can show me a case where this is slow enough to matter in any real-world application,
+ * I will buy you a beer.
+ */
+#[instrument(skip_all)]
 fn handle_knock(
     packet: &[u8],
-    knock_states: &mut SlotMap<DefaultKey, KnockState>,
-    active_knocks: &mut HashMap<IpAddr, KnockKey>,
-    expiration_queue: &mut BTreeMap<Instant, Vec<(IpAddr, KnockKey)>>,
+    knock_states: &mut KnockStates,
+    active_knocks: &mut ActiveKnocks,
+    expiration_queue: &mut ExpirationQueue,
 ) {
     let Ok(KnockMeta {
-        dst_addr, dst_port, ..
+        dst_addr: addr,
+        dst_port: port,
+        ..
     }) = KnockMeta::try_from(packet)
     else {
         return;
     };
 
-    let span = tracing::info_span!("packet", %dst_addr, %dst_port);
-    let _entered = span.enter();
+    let span = info_span!("packet", %addr, %port);
+    let _enter = span.enter();
 
-    let knock_entry = active_knocks.entry(dst_addr);
+    let knock_entry = active_knocks.entry(addr);
 
     let knock = match &knock_entry {
-        Entry::Vacant(_) => KnockState::try_new(dst_port),
+        Entry::Vacant(_) => KnockState::try_new(port),
         Entry::Occupied(e) => {
             if let KnockState::Passed { .. } = knock_states[e.get().clone()] {
                 trace!("Door already open");
                 return;
             }
 
-            knock_states
-                .remove(e.get().clone())
-                .unwrap()
-                .progress(dst_port)
+            // We must remove the key to invalidate cleanup
+            knock_states.remove(e.get().clone()).unwrap().progress(port)
         }
     };
 
@@ -144,13 +157,14 @@ fn handle_knock(
         .filter(|e| e.key() == &expiration)
     {
         Some(mut e) => {
-            e.get_mut().push((dst_addr, knock_key));
+            e.get_mut().push((addr, knock_key));
         }
         None => {
-            expiration_queue.insert(expiration, vec![(dst_addr, knock_key)]);
+            expiration_queue.insert(expiration, vec![(addr, knock_key)]);
         }
     };
 
+    // Probably a premature optimization. But why re-hash when you don't need to?
     match knock_entry {
         Entry::Occupied(mut e) => {
             e.insert(knock_key);
@@ -171,10 +185,11 @@ fn handle_knock(
     }
 }
 
+#[instrument(skip_all)]
 fn handle_cleanup(
-    knock_states: &mut SlotMap<DefaultKey, KnockState>,
-    active_knocks: &mut HashMap<IpAddr, KnockKey>,
-    expiration_queue: &mut BTreeMap<Instant, Vec<(IpAddr, KnockKey)>>,
+    knock_states: &mut KnockStates,
+    active_knocks: &mut ActiveKnocks,
+    expiration_queue: &mut ExpirationQueue,
 ) {
     // Cannot use the one from cleanup interval, as we are using quanta's version for performance
     let now = Instant::recent();
@@ -185,9 +200,9 @@ fn handle_cleanup(
     for (addr, key) in expired_items.into_values().flatten() {
         if let Some(knock) = knock_states.remove(key) {
             if matches!(knock, KnockState::Passed { .. }) {
-                info!("Door closed for {addr}");
+                info!(%addr, "Door closed");
             } else {
-                info!("Cleared knock attempts for {addr}");
+                info!(%addr, "Cleared knock attempts");
             }
             active_knocks.remove(&addr);
         }
