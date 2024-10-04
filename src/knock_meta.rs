@@ -61,7 +61,7 @@ impl TryFrom<&[u8]> for KnockMeta {
             };
         }
 
-        let packet = some!(EthernetPacket::new(&value), "Invalid Ethernet packet");
+        let packet = some!(EthernetPacket::new(value), "Invalid Ethernet packet");
         let mut payload = packet.payload();
 
         let (src_addr, dst_addr, ip_next) = match packet.get_ethertype() {

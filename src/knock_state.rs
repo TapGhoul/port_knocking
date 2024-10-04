@@ -81,8 +81,8 @@ impl KnockState {
 
     pub fn expiration(&self) -> Instant {
         match self {
-            KnockState::PortPending { expires_at, .. } => expires_at.clone(),
-            KnockState::Passed { expires_at } => expires_at.clone(),
+            KnockState::PortPending { expires_at, .. } => *expires_at,
+            KnockState::Passed { expires_at } => *expires_at,
             KnockState::Failed => unreachable!("This should never be called in this cases"),
         }
     }

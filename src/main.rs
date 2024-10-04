@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::time::interval;
 use tokio::{pin, select};
-use tracing::{info, info_span, instrument, trace, Level};
+use tracing::{info, instrument, trace, Level, Span};
 
 type KnockKey = DefaultKey;
 type KnockStates = SlotMap<KnockKey, KnockState>;
@@ -123,21 +123,22 @@ fn handle_knock(
         return;
     };
 
-    let span = info_span!("packet", %addr, %port);
-    let _enter = span.enter();
+    Span::current()
+        .record("addr", addr.to_string())
+        .record("port", port);
 
     let knock_entry = active_knocks.entry(addr);
 
     let knock = match &knock_entry {
         Entry::Vacant(_) => KnockState::try_new(port),
         Entry::Occupied(e) => {
-            if let KnockState::Passed { .. } = knock_states[e.get().clone()] {
+            if let KnockState::Passed { .. } = knock_states[*e.get()] {
                 trace!("Door already open");
                 return;
             }
 
             // We must remove the key to invalidate cleanup
-            knock_states.remove(e.get().clone()).unwrap().progress(port)
+            knock_states.remove(*e.get()).unwrap().progress(port)
         }
     };
 
