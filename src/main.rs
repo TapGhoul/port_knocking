@@ -38,7 +38,32 @@ fn main() {
 }
 
 async fn run() {
-    let mut knock_states = slotmap::SlotMap::<KnockKey, KnockState>::new();
+    /*
+     * The reason we use a slotmap instead of an Rc<T> here is we want to use its generational indexes
+     * so when expiration comes around, we can ensure we don't accidentally expire old data.
+     * We are using the Quanta "recent" instant for performance, as we are potentially parsing a huge
+     * number of packets per second, and are doing this single-threaded (multithreading here YAGNI)
+     *
+     * We could theoretically store a copy of the generation separately, but why reinvent the wheel?
+     * We get easy deduplication here too.
+     *
+     * This could potentially be improved (without full on interning) by implementing a custom hash
+     * and comparison into our KnockState to let us use a HashSet and avoid duplicating IpAddr instances,
+     * but I'm not going to lose sleep over wasting 17 bytes here and there for what is a toy (size of IpAddr enum).
+     *
+     * I'm sure there's many ways to further optimize this, and realistically these things should be
+     * properly benchmarked. But I will leave that as an exercise to the reader
+     * (which will probably be me in 6 months).
+     *
+     * As for using a BTreeMap here, it's an easy way to do a queue. Again, realistically, I should
+     * use a ring buffer or something. But it's fine. Really. I'm not going to talk myself into
+     * spending another 3 days mico-benchmarking this. I swear.
+     *
+     * Also ahash is fast as fuck, so I'm not all that concerned about collisions here. If you want
+     * to replace this with a sparse bitmap or something that'll have theoretically faster access
+     * and write times, that's on you. I'm happy with ahash and hashmaps for now.
+     */
+    let mut knock_states = SlotMap::<KnockKey, KnockState>::new();
     let mut active_knocks = HashMap::<IpAddr, KnockKey>::new();
     let mut expiration_queue = BTreeMap::<Instant, Vec<(IpAddr, KnockKey)>>::new();
     let mut buf = [0u8; 256];
