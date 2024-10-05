@@ -12,11 +12,14 @@ use std::cmp::Reverse;
 use std::collections::binary_heap::PeekMut;
 use std::collections::hash_map::Entry;
 use std::collections::BinaryHeap;
+use std::future::{poll_fn, Future};
 use std::net::IpAddr;
+use std::pin::pin;
+use std::task::Poll;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::time::interval;
-use tokio::{pin, select};
+use tokio::select;
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, instrument, trace, Level, Span};
 
 type KnockKey = DefaultKey;
@@ -31,78 +34,90 @@ fn main() {
         .without_time()
         .init();
 
-    let _upkeep = Upkeep::new(Duration::from_millis(5)).start().unwrap();
+    let _upkeep = Upkeep::new(Duration::from_millis(5))
+        .start()
+        .expect("this should be the only call to Upkeep::start");
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .expect("tokio should be functional");
 
     rt.block_on(run());
 }
 
 async fn run() {
-    /*
-     * The reason we use a slotmap instead of an Rc<T> here is we want to use its generational indexes
-     * so when expiration comes around, we can ensure we don't accidentally expire old data.
-     * We are using the Quanta "recent" instant for performance, as we are potentially parsing a huge
-     * number of packets per second, and are doing this single-threaded (multithreading here YAGNI)
-     *
-     * We could theoretically store a copy of the generation separately, but why reinvent the wheel?
-     * We get easy deduplication here too.
-     *
-     * This could potentially be improved (without full on interning) by implementing a custom hash
-     * and comparison into our KnockState to let us use a HashSet and avoid duplicating IpAddr instances,
-     * but I'm not going to lose sleep over wasting 17 bytes here and there for what is a toy (size of IpAddr enum).
-     *
-     * I'm sure there's many ways to further optimize this, and realistically these things should be
-     * properly benchmarked. But I will leave that as an exercise to the reader
-     * (which will probably be me in 6 months).
-     *
-     * As for using a BinaryHeap here, it's an easy way to do a queue. Again, realistically, I should
-     * use a ring buffer or something. But it's fine. Really. I'm not going to talk myself into
-     * spending another 3 days mico-benchmarking this. I swear.
-     *
-     * Also ahash is fast as fuck, so I'm not all that concerned about collisions here. If you want
-     * to replace this with a sparse bitmap or something that'll have theoretically faster access
-     * and write times, that's on you. I'm happy with ahash and hashmaps for now.
-     */
+    // The reason we use a slotmap instead of an Rc<T> here is we want to use its generational indexes
+    // so when expiration comes around, we can ensure we don't accidentally expire old data.
+    // We are using the Quanta "recent" instant for performance, as we are potentially parsing a huge
+    // number of packets per second, and are doing this single-threaded (multithreading here YAGNI)
+    //
+    // We could theoretically store a copy of the generation separately, but why reinvent the wheel?
+    // We get easy deduplication here too.
+    //
+    // This could potentially be improved memory-wise by interning (or at least reusing) a knock key with
+    // more metadata, but realistically I'm not that memory-constrained (IpAddr is 17 bytes for ipv6 + enum discrim)
+    //
+    // Realistically, I could use something that allows me to remove unnecessary deadlines as I get them
+    // as we can change this up trivially to have a more stable key on both sides. But, this is simpler,
+    // and likely faster in the performance-sensitive component of parsing headers off the socket,
+    // and I'm not *that* memory-constrained.
+    //
+    // Also ahash is really damn fast, and I'm not all that concerned about collisions here. If you want
+    // to replace this with something stronger, you could, but I'm not that concerned with collision overhead here.
     let mut knock_states = KnockStates::new();
     let mut active_knocks = ActiveKnocks::new();
     let mut expiration_queue = ExpirationQueue::new();
     let mut buf = [0u8; 256];
 
-    let mut socket = RawSocket::new().unwrap();
-    let cleanup_interval = interval(Duration::from_secs(5));
-    pin!(cleanup_interval);
+    let mut socket = RawSocket::new().expect("should be able to open a raw socket");
+
+    let mut cleanup_interrupted = false;
+    let mut cleanup_interval = pin!(interval(Duration::from_secs(5)));
+    cleanup_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
+        let pending_cleanup_fut = poll_fn(|_cx| {
+            if cleanup_interrupted {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
+
         select! {
             biased;
-            count = socket.read(&mut buf) => {
-                let count = count.expect("socket is dead");
+            read_bytes = socket.read(&mut buf) => {
+                let read_bytes = read_bytes.expect("socket shouldn't be dead");
                 handle_knock(
-                    &buf[..count],
+                    &buf[..read_bytes],
                     &mut knock_states,
                     &mut active_knocks,
                     &mut expiration_queue,
                 );
-            },
+            }
             _ = cleanup_interval.tick() => {
-                handle_cleanup(
+                cleanup_interrupted = perform_cleanup(
+                    &socket,
                     &mut knock_states,
                     &mut active_knocks,
                     &mut expiration_queue
-                );
+                ).await;
+            }
+            _ = pending_cleanup_fut => {
+                cleanup_interrupted = perform_cleanup(
+                    &socket,
+                    &mut knock_states,
+                    &mut active_knocks,
+                    &mut expiration_queue
+                ).await;
             }
         }
     }
 }
 
-/*
- * If you think this looks like it's overcomplicated, you'd be correct. But, I avoid re-hashing
- * wherever possible. You can't stop me, I ain't getting paid to do it right. Lemme have my fun.
- */
+// If you think this looks like it's overcomplicated, you'd be correct. But, I avoid re-hashing
+// wherever possible. You can't stop me, I ain't getting paid to do it right. Lemme have my fun.
 #[instrument(skip_all)]
 fn handle_knock(
     packet: &[u8],
@@ -128,13 +143,19 @@ fn handle_knock(
     let knock = match &knock_entry {
         Entry::Vacant(_) => KnockState::try_new(port),
         Entry::Occupied(e) => {
-            if let KnockState::Passed { .. } = knock_states[*e.get()] {
+            let knock_key = *e.get();
+
+            // If this panics, you've
+            if let KnockState::Passed { .. } = knock_states
+                .get(knock_key)
+                .expect("active knocks should only contain valid knock states")
+            {
                 trace!("Door already open");
                 return;
             }
 
             // We must remove the key to invalidate cleanup
-            knock_states.remove(*e.get()).unwrap().progress(port)
+            knock_states.remove(knock_key).unwrap().progress(port)
         }
     };
 
@@ -170,19 +191,31 @@ fn handle_knock(
     }
 }
 
+/// Returns true if cleanup was interrupted by the scheduler
 #[instrument(skip_all)]
-fn handle_cleanup(
+async fn perform_cleanup(
+    socket: &RawSocket,
     knock_states: &mut KnockStates,
     active_knocks: &mut ActiveKnocks,
     expiration_queue: &mut ExpirationQueue,
-) {
+) -> bool {
     // Cannot use the one from cleanup interval, as we are using quanta's version for performance
     let now = Instant::recent();
+    let mut readable = pin!(socket.readable());
 
-    //Reverse((expiration, knock_key, addr))
     while let Some(item) = expiration_queue.peek_mut() {
         if item.0 .0 > now {
-            continue;
+            return false;
+        }
+
+        // We have something on our socket - bail out early!
+        if poll_fn(|cx| {
+            let readable = readable.as_mut().poll(cx);
+            Poll::Ready(readable.is_ready())
+        })
+        .await
+        {
+            return true;
         }
 
         let Reverse((_, knock_key, addr)) = PeekMut::pop(item);
@@ -200,4 +233,6 @@ fn handle_cleanup(
             info!(%addr, "Cleared knock attempts");
         }
     }
+
+    false
 }

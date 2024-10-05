@@ -24,39 +24,31 @@ pub struct TryFromSliceError;
 
 impl TryFrom<&[u8]> for KnockMeta {
     type Error = TryFromSliceError;
-
-    /*
-     * I know someone will yell at me about the single responsibility principle or something like that.
-     * I like my wall of code. My wall of code works. This is hacky experiment code I wrote and iterated on
-     * a huge number of times. This doesn't deserve to be in a real product, and it never will be.
-     * But it works, and that's all I care about.
-     */
-    /**
-     * This method makes some assumptions - you only care about SYN packets on TCP and all UDP packets,
-     * and you don't care if the packet comes from TCP or UDP.
-     *
-     * It also parses more than I need, but I wanted something I could toy with later.
-     */
+    /// This method makes some assumptions - you only care about SYN packets on TCP and all UDP packets,
+    /// and you don't care if the packet comes from TCP or UDP.
+    ///
+    /// It also parses more than I need, but I wanted something I could toy with later.
+    /// This method's complexity is high, but honestly that's fine for now
     #[instrument(name = "parse_packet")]
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         macro_rules! bail {
-            ($m:literal) => {{
-                trace!(msg = $m, "bail");
+            ($msg:expr) => {{
+                trace!(msg = $msg, "bail");
                 return Err(TryFromSliceError);
             }};
         }
         macro_rules! check {
-            ($v:expr, $m:literal) => {
-                if !$v {
-                    bail!($m)
+            ($bool:expr, $msg:expr) => {
+                if !$bool {
+                    bail!($msg)
                 }
             };
         }
         macro_rules! some {
-            ($v:expr, $m:literal) => {
-                match $v {
+            ($opt:expr, $msg:expr) => {
+                match $opt {
                     Some(e) => e,
-                    None => bail!($m),
+                    None => bail!($msg),
                 }
             };
         }
