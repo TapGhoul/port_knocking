@@ -9,6 +9,7 @@ use quanta::{Instant, Upkeep};
 use slotmap::{DefaultKey, SlotMap};
 use socket::RawSocket;
 use std::cmp::Reverse;
+use std::collections::binary_heap::PeekMut;
 use std::collections::hash_map::Entry;
 use std::collections::BinaryHeap;
 use std::net::IpAddr;
@@ -21,7 +22,7 @@ use tracing::{info, instrument, trace, Level, Span};
 type KnockKey = DefaultKey;
 type KnockStates = SlotMap<KnockKey, KnockState>;
 type ActiveKnocks = HashMap<IpAddr, KnockKey>;
-type ExpirationQueue = BinaryHeap<(Reverse<Instant>, KnockKey, IpAddr)>;
+type ExpirationQueue = BinaryHeap<Reverse<(Instant, KnockKey, IpAddr)>>;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -101,11 +102,6 @@ async fn run() {
 /*
  * If you think this looks like it's overcomplicated, you'd be correct. But, I avoid re-hashing
  * wherever possible. You can't stop me, I ain't getting paid to do it right. Lemme have my fun.
- *
- * You'd think cloning the key is some awful thing. But it's defined as
- * `DefaultKey(KeyData { idx: u32, version: NonZeroU32 })` - 8 bytes.
- * If anyone can show me a case where this is slow enough to matter in any real-world application,
- * I will buy you a beer.
  */
 #[instrument(skip_all)]
 fn handle_knock(
@@ -151,7 +147,7 @@ fn handle_knock(
     }
 
     let knock_key = knock_states.insert(knock);
-    expiration_queue.push((Reverse(knock.expiration()), knock_key, addr));
+    expiration_queue.push(Reverse((knock.expiration(), knock_key, addr)));
 
     // Probably a premature optimization. But why re-hash when you don't need to?
     match knock_entry {
@@ -183,12 +179,14 @@ fn handle_cleanup(
     // Cannot use the one from cleanup interval, as we are using quanta's version for performance
     let now = Instant::recent();
 
-    while expiration_queue
-        .peek()
-        .map(|(Reverse(expiration), ..)| *expiration <= now)
-        .is_some()
-    {
-        let (_, knock_key, addr) = expiration_queue.pop().unwrap();
+    //Reverse((expiration, knock_key, addr))
+    while let Some(item) = expiration_queue.peek_mut() {
+        if item.0 .0 > now {
+            continue;
+        }
+
+        let Reverse((_, knock_key, addr)) = PeekMut::pop(item);
+
         // We don't want to accidentally clear an expired knock
         let Some(knock) = knock_states.remove(knock_key) else {
             continue;
