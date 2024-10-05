@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::select;
 use tokio::time::{interval, MissedTickBehavior};
+use tracing::field::debug;
 use tracing::{info, instrument, trace, Level, Span};
 
 type KnockKey = DefaultKey;
@@ -223,6 +224,7 @@ async fn perform_cleanup(
         })
         .await
         {
+            debug("Interrupted by socket becoming readable");
             return true;
         }
 
