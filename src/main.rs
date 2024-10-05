@@ -118,7 +118,7 @@ async fn run() {
 
 // If you think this looks like it's overcomplicated, you'd be correct. But, I avoid re-hashing
 // wherever possible. You can't stop me, I ain't getting paid to do it right. Lemme have my fun.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(addr, port))]
 fn handle_knock(
     packet: &[u8],
     knock_states: &mut KnockStates,
@@ -209,6 +209,14 @@ async fn perform_cleanup(
         }
 
         // We have something on our socket - bail out early!
+        // This involves mutexes internally, even on a single thread, but is the "safest" way to do this
+        // as it handles multiple wakers correctly. Ideally this should be a separate signalling primitive
+        // or something like that.
+        // But, in the worst case scenario of a huge amount of garbage and a lot of incoming packets,
+        // this will allow us to handle new knocks sooner in exchange for filling up with more garbage.
+        //
+        // This could result in a problematic leak if someone spams our first knock port with a SYN
+        // flood, but if that becomes a problem we can just set a hard limit on our garbage amount.
         if poll_fn(|cx| {
             let readable = readable.as_mut().poll(cx);
             Poll::Ready(readable.is_ready())
