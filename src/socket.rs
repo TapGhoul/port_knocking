@@ -1,19 +1,23 @@
-use socket2::{Domain, Protocol, Socket, Type};
+use nix::sys::socket::{recv, socket, AddressFamily, MsgFlags, SockFlag, SockProtocol, SockType};
 use std::io;
-use std::io::Read;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, Interest, ReadBuf};
 
 pub struct RawSocket {
-    inner: AsyncFd<Socket>,
+    inner: AsyncFd<OwnedFd>,
 }
 
 impl RawSocket {
     pub fn new() -> io::Result<Self> {
-        let sock = Socket::new_raw(Domain::PACKET, Type::RAW, Some(Protocol::from(768)))?;
-        sock.set_nonblocking(true)?;
+        let sock = socket(
+            AddressFamily::Packet,
+            SockType::Raw,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+            SockProtocol::EthAll,
+        )?;
         let inner = AsyncFd::with_interest(sock, Interest::READABLE)?;
         Ok(Self { inner })
     }
@@ -41,7 +45,12 @@ impl AsyncRead for RawSocket {
             let mut guard = ready!(self.inner.poll_read_ready(cx))?;
 
             let unfilled = buf.initialize_unfilled();
-            match guard.try_io(|inner| inner.get_ref().read(unfilled)) {
+
+            let read_result = guard.try_io(|inner| {
+                recv(inner.as_raw_fd(), unfilled, MsgFlags::empty()).map_err(|e| e.into())
+            });
+
+            match read_result {
                 Ok(Ok(len)) => {
                     buf.advance(len);
                     return Poll::Ready(Ok(()));
