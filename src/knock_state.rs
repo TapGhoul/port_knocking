@@ -7,13 +7,8 @@ const PASSED_DURATION: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq)]
 pub enum KnockState {
-    PortPending {
-        last_idx: usize,
-        expires_at: Instant,
-    },
-    Passed {
-        expires_at: Instant,
-    },
+    PortPending { last_idx: usize, expires: Instant },
+    Passed { expires: Instant },
     Failed,
 }
 
@@ -22,7 +17,7 @@ impl KnockState {
         if port == PORT_SEQUENCE[0] {
             Self::PortPending {
                 last_idx: 0,
-                expires_at: Instant::recent() + PENDING_DURATION,
+                expires: Instant::recent() + PENDING_DURATION,
             }
         } else {
             Self::Failed
@@ -39,7 +34,7 @@ impl KnockState {
         if port == PORT_SEQUENCE[0] {
             return Self::PortPending {
                 last_idx: 0,
-                expires_at: Instant::recent() + PENDING_DURATION,
+                expires: Instant::recent() + PENDING_DURATION,
             };
         }
 
@@ -47,7 +42,7 @@ impl KnockState {
         if port == PORT_SEQUENCE[last_idx] {
             return Self::PortPending {
                 last_idx,
-                expires_at: Instant::recent() + PENDING_DURATION,
+                expires: Instant::recent() + PENDING_DURATION,
             };
         }
 
@@ -59,21 +54,27 @@ impl KnockState {
         // End of sequence
         if last_idx + 2 == PORT_SEQUENCE.len() {
             return Self::Passed {
-                expires_at: Instant::recent() + PASSED_DURATION,
+                expires: Instant::recent() + PASSED_DURATION,
             };
         }
 
         // Next knock
         Self::PortPending {
             last_idx: last_idx + 1,
-            expires_at: Instant::recent() + PENDING_DURATION,
+            expires: Instant::recent() + PENDING_DURATION,
         }
     }
 
     pub fn is_valid(&self) -> bool {
         match self {
-            KnockState::PortPending { expires_at, .. } => expires_at > &Instant::recent(),
-            KnockState::Passed { expires_at, .. } => expires_at > &Instant::recent(),
+            KnockState::PortPending {
+                expires: expires_at,
+                ..
+            } => expires_at > &Instant::recent(),
+            KnockState::Passed {
+                expires: expires_at,
+                ..
+            } => expires_at > &Instant::recent(),
             // If rust had #[hot] and it worked on match arms, it would go here
             KnockState::Failed => false,
         }
@@ -81,8 +82,8 @@ impl KnockState {
 
     pub fn expiration(&self) -> Instant {
         match self {
-            KnockState::PortPending { expires_at, .. } => *expires_at,
-            KnockState::Passed { expires_at } => *expires_at,
+            KnockState::PortPending { expires, .. } => *expires,
+            KnockState::Passed { expires } => *expires,
             KnockState::Failed => unreachable!("This should never be called in this cases"),
         }
     }

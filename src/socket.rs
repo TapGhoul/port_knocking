@@ -21,18 +21,6 @@ impl RawSocket {
         let inner = AsyncFd::with_interest(sock, Interest::READABLE)?;
         Ok(Self { inner })
     }
-
-    /// Wait until the socket is readable.
-    ///
-    /// This is not really used in any actual logic for this purpose - it's primarily used to notify
-    /// when to cancel background jobs.
-    pub async fn readable(&self) {
-        self.inner
-            .readable()
-            .await
-            .expect("socket shouldn't be dead")
-            .retain_ready();
-    }
 }
 
 impl AsyncRead for RawSocket {

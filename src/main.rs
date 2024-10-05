@@ -1,18 +1,18 @@
+mod expire;
 mod knock_meta;
 mod knock_state;
 mod socket;
 
 use ahash::{HashMap, HashMapExt};
+use expire::ExpirationQueue;
 use knock_meta::KnockMeta;
 use knock_state::KnockState;
-use quanta::{Instant, Upkeep};
-use slotmap::{DefaultKey, SlotMap};
+use quanta::Upkeep;
+use slotmap::{new_key_type, SlotMap};
 use socket::RawSocket;
-use std::cmp::Reverse;
-use std::collections::binary_heap::PeekMut;
 use std::collections::hash_map::Entry;
-use std::collections::BinaryHeap;
-use std::future::{poll_fn, Future};
+use std::future::poll_fn;
+use std::mem::forget;
 use std::net::IpAddr;
 use std::pin::pin;
 use std::task::Poll;
@@ -20,13 +20,12 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::select;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::field::debug;
 use tracing::{info, instrument, trace, Level, Span};
 
-type KnockKey = DefaultKey;
+new_key_type! { struct KnockKey; }
+
 type KnockStates = SlotMap<KnockKey, KnockState>;
 type ActiveKnocks = HashMap<IpAddr, KnockKey>;
-type ExpirationQueue = BinaryHeap<Reverse<(Instant, KnockKey, IpAddr)>>;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -35,9 +34,12 @@ fn main() {
         .without_time()
         .init();
 
-    let _upkeep = Upkeep::new(Duration::from_millis(5))
+    let upkeep = Upkeep::new(Duration::from_millis(5))
         .start()
         .expect("this should be the only call to Upkeep::start");
+
+    // We never want this to die, so just forget it.
+    forget(upkeep);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -66,20 +68,22 @@ async fn run() {
     //
     // Also ahash is really damn fast, and I'm not all that concerned about collisions here. If you want
     // to replace this with something stronger, you could, but I'm not that concerned with collision overhead here.
-    let mut knock_states = KnockStates::new();
+    let mut knock_states = KnockStates::with_key();
     let mut active_knocks = ActiveKnocks::new();
     let mut expiration_queue = ExpirationQueue::new();
     let mut buf = [0u8; 256];
 
     let mut socket = RawSocket::new().expect("should be able to open a raw socket");
 
-    let mut cleanup_interrupted = false;
+    let mut pending_cleanup = false;
     let mut cleanup_interval = pin!(interval(Duration::from_secs(5)));
     cleanup_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        let pending_cleanup_fut = poll_fn(|_cx| {
-            if cleanup_interrupted {
+        let pending_cleanup_fut = poll_fn(|cx| {
+            let tick_result = cleanup_interval.poll_tick(cx).is_ready();
+
+            if tick_result || pending_cleanup {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -97,21 +101,12 @@ async fn run() {
                     &mut expiration_queue,
                 );
             }
-            _ = cleanup_interval.tick() => {
-                cleanup_interrupted = perform_cleanup(
-                    &socket,
-                    &mut knock_states,
-                    &mut active_knocks,
-                    &mut expiration_queue
-                ).await;
-            }
             _ = pending_cleanup_fut => {
-                cleanup_interrupted = perform_cleanup(
-                    &socket,
+                // If this is slow/heavy, we could make it do up to N iterations every time
+                pending_cleanup = expiration_queue.try_clean_next(
                     &mut knock_states,
-                    &mut active_knocks,
-                    &mut expiration_queue
-                ).await;
+                    &mut active_knocks
+                );
             }
         }
     }
@@ -169,7 +164,7 @@ fn handle_knock(
     }
 
     let knock_key = knock_states.insert(knock);
-    expiration_queue.push(Reverse((knock.expiration(), knock_key, addr)));
+    expiration_queue.insert(knock.expiration(), knock_key, addr);
 
     // Probably a premature optimization. But why re-hash when you don't need to?
     match knock_entry {
@@ -190,59 +185,4 @@ fn handle_knock(
         }
         KnockState::Failed => unreachable!("This is never valid by this point"),
     }
-}
-
-/// Returns true if cleanup was interrupted by the scheduler
-#[instrument(skip_all)]
-async fn perform_cleanup(
-    socket: &RawSocket,
-    knock_states: &mut KnockStates,
-    active_knocks: &mut ActiveKnocks,
-    expiration_queue: &mut ExpirationQueue,
-) -> bool {
-    // Cannot use the one from cleanup interval, as we are using quanta's version for performance
-    let now = Instant::recent();
-    let mut readable = pin!(socket.readable());
-
-    while let Some(item) = expiration_queue.peek_mut() {
-        if item.0 .0 > now {
-            return false;
-        }
-
-        // We have something on our socket - bail out early!
-        // This involves mutexes internally, even on a single thread, but is the "safest" way to do this
-        // as it handles multiple wakers correctly. Ideally this should be a separate signalling primitive
-        // or something like that.
-        // But, in the worst case scenario of a huge amount of garbage and a lot of incoming packets,
-        // this will allow us to handle new knocks sooner in exchange for filling up with more garbage.
-        //
-        // This could result in a problematic leak if someone spams our first knock port with a SYN
-        // flood, but if that becomes a problem we can just set a hard limit on our garbage amount.
-        if poll_fn(|cx| {
-            let readable = readable.as_mut().poll(cx);
-            Poll::Ready(readable.is_ready())
-        })
-        .await
-        {
-            debug("Interrupted by socket becoming readable");
-            return true;
-        }
-
-        let Reverse((_, knock_key, addr)) = PeekMut::pop(item);
-
-        // We don't want to accidentally clear an expired knock
-        let Some(knock) = knock_states.remove(knock_key) else {
-            continue;
-        };
-
-        active_knocks.remove(&addr);
-
-        if matches!(knock, KnockState::Passed { .. }) {
-            info!(%addr, "Door closed");
-        } else {
-            info!(%addr, "Cleared knock attempts");
-        }
-    }
-
-    false
 }
