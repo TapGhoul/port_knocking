@@ -103,10 +103,7 @@ async fn run() {
             }
             _ = pending_cleanup_fut => {
                 // If this is slow/heavy, we could make it do up to N iterations every time
-                pending_cleanup = expiration_queue.try_clean_next(
-                    &mut knock_states,
-                    &mut active_knocks
-                );
+                pending_cleanup = expiration_queue.try_clean_next(&mut knock_states, &mut active_knocks);
             }
         }
     }
